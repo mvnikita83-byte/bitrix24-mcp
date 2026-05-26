@@ -1,11 +1,13 @@
 import httpx
 import os
 import json
-from mcp.server.fastmcp import FastMCP
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
+import asyncio
 
 BITRIX_WEBHOOK = os.environ.get("BITRIX_WEBHOOK", "").rstrip("/")
 
-mcp = FastMCP("Bitrix24")
+app = FastAPI()
 
 async def b24(method: str, params: dict = {}) -> dict:
     url = f"{BITRIX_WEBHOOK}/{method}.json"
@@ -14,195 +16,217 @@ async def b24(method: str, params: dict = {}) -> dict:
         r.raise_for_status()
         return r.json()
 
-# ─── CRM: Лиды ────────────────────────────────────────────────────────────────
+TOOLS = [
+    {
+        "name": "crm_get_leads",
+        "description": "Получить список лидов из CRM Битрикс24",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Количество лидов", "default": 20}
+            }
+        }
+    },
+    {
+        "name": "crm_get_deals",
+        "description": "Получить список сделок из CRM Битрикс24",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Количество сделок", "default": 20}
+            }
+        }
+    },
+    {
+        "name": "crm_create_lead",
+        "description": "Создать новый лид в CRM",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Название лида"},
+                "name": {"type": "string", "description": "Имя"},
+                "last_name": {"type": "string", "description": "Фамилия"},
+                "phone": {"type": "string", "description": "Телефон"},
+                "email": {"type": "string", "description": "Email"}
+            },
+            "required": ["title"]
+        }
+    },
+    {
+        "name": "tasks_get",
+        "description": "Получить список задач из Битрикс24",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Количество задач", "default": 20}
+            }
+        }
+    },
+    {
+        "name": "tasks_create",
+        "description": "Создать задачу в Битрикс24",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Название задачи"},
+                "description": {"type": "string", "description": "Описание"},
+                "deadline": {"type": "string", "description": "Дедлайн в формате 2026-06-30T18:00:00"}
+            },
+            "required": ["title"]
+        }
+    },
+    {
+        "name": "users_get",
+        "description": "Получить список сотрудников Битрикс24",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "active_only": {"type": "boolean", "description": "Только активные", "default": True}
+            }
+        }
+    },
+    {
+        "name": "telephony_get_calls",
+        "description": "Получить статистику звонков из Битрикс24",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Количество записей", "default": 20},
+                "date_from": {"type": "string", "description": "Дата от (2026-05-01)"},
+                "date_to": {"type": "string", "description": "Дата до (2026-05-31)"}
+            }
+        }
+    }
+]
 
-@mcp.tool()
-async def crm_get_leads(limit: int = 20, filter: str = "") -> str:
-    """Получить список лидов из CRM. filter — JSON строка фильтра, например '{\"STATUS_ID\": \"NEW\"}'"""
-    params = {"order": {"DATE_CREATE": "DESC"}, "select": ["ID", "TITLE", "NAME", "LAST_NAME", "PHONE", "EMAIL", "STATUS_ID", "DATE_CREATE", "ASSIGNED_BY_ID"], "start": 0}
-    params["limit"] = limit
-    if filter:
+async def call_tool(name: str, args: dict) -> str:
+    try:
+        if name == "crm_get_leads":
+            r = await b24("crm.lead.list", {
+                "order": {"DATE_CREATE": "DESC"},
+                "select": ["ID", "TITLE", "NAME", "LAST_NAME", "PHONE", "STATUS_ID", "DATE_CREATE"],
+                "limit": args.get("limit", 20)
+            })
+            return json.dumps(r.get("result", []), ensure_ascii=False, indent=2)
+
+        elif name == "crm_get_deals":
+            r = await b24("crm.deal.list", {
+                "order": {"DATE_CREATE": "DESC"},
+                "select": ["ID", "TITLE", "STAGE_ID", "OPPORTUNITY", "DATE_CREATE"],
+                "limit": args.get("limit", 20)
+            })
+            return json.dumps(r.get("result", []), ensure_ascii=False, indent=2)
+
+        elif name == "crm_create_lead":
+            fields = {"TITLE": args["title"]}
+            if args.get("name"): fields["NAME"] = args["name"]
+            if args.get("last_name"): fields["LAST_NAME"] = args["last_name"]
+            if args.get("phone"): fields["PHONE"] = [{"VALUE": args["phone"], "VALUE_TYPE": "WORK"}]
+            if args.get("email"): fields["EMAIL"] = [{"VALUE": args["email"], "VALUE_TYPE": "WORK"}]
+            r = await b24("crm.lead.add", {"fields": fields})
+            return json.dumps(r, ensure_ascii=False)
+
+        elif name == "tasks_get":
+            r = await b24("tasks.task.list", {
+                "order": {"CREATED_DATE": "desc"},
+                "select": ["ID", "TITLE", "STATUS", "RESPONSIBLE_ID", "DEADLINE"],
+                "params": {"NAV_PARAMS": {"nPageSize": args.get("limit", 20)}}
+            })
+            return json.dumps(r.get("result", {}).get("tasks", []), ensure_ascii=False, indent=2)
+
+        elif name == "tasks_create":
+            fields = {"TITLE": args["title"]}
+            if args.get("description"): fields["DESCRIPTION"] = args["description"]
+            if args.get("deadline"): fields["DEADLINE"] = args["deadline"]
+            r = await b24("tasks.task.add", {"fields": fields})
+            return json.dumps(r.get("result", {}), ensure_ascii=False)
+
+        elif name == "users_get":
+            params = {"select": ["ID", "NAME", "LAST_NAME", "EMAIL", "WORK_PHONE", "ACTIVE"]}
+            if args.get("active_only", True):
+                params["filter"] = {"ACTIVE": True}
+            r = await b24("user.get", params)
+            return json.dumps(r.get("result", []), ensure_ascii=False, indent=2)
+
+        elif name == "telephony_get_calls":
+            filter_params = {}
+            if args.get("date_from"): filter_params[">CALL_START_DATE"] = args["date_from"]
+            if args.get("date_to"): filter_params["<CALL_START_DATE"] = args["date_to"]
+            r = await b24("voximplant.statistic.get", {
+                "filter": filter_params,
+                "select": ["ID", "PORTAL_USER_ID", "CALL_TYPE", "CALL_DURATION", "CALL_START_DATE", "PHONE_NUMBER"],
+                "limit": args.get("limit", 20)
+            })
+            return json.dumps(r.get("result", []), ensure_ascii=False, indent=2)
+
+        else:
+            return f"Unknown tool: {name}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+async def handle_rpc(data: dict) -> dict:
+    method = data.get("method")
+    req_id = data.get("id")
+    params = data.get("params", {})
+
+    if method == "initialize":
+        return {
+            "jsonrpc": "2.0", "id": req_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "bitrix24-mcp", "version": "1.0.0"}
+            }
+        }
+    elif method == "tools/list":
+        return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOLS}}
+
+    elif method == "tools/call":
+        tool_name = params.get("name")
+        tool_args = params.get("arguments", {})
+        result = await call_tool(tool_name, tool_args)
+        return {
+            "jsonrpc": "2.0", "id": req_id,
+            "result": {"content": [{"type": "text", "text": result}]}
+        }
+    else:
+        return {"jsonrpc": "2.0", "id": req_id, "result": {}}
+
+
+@app.get("/sse")
+async def sse_get(request: Request):
+    async def event_stream():
+        yield f"data: {json.dumps({'jsonrpc': '2.0', 'method': 'notifications/initialized'})}\n\n"
         try:
-            params["filter"] = json.loads(filter)
+            async for chunk in request.stream():
+                if chunk:
+                    try:
+                        data = json.loads(chunk)
+                        response = await handle_rpc(data)
+                        yield f"data: {json.dumps(response)}\n\n"
+                    except Exception:
+                        pass
         except Exception:
             pass
-    result = await b24("crm.lead.list", params)
-    leads = result.get("result", [])
-    return json.dumps(leads, ensure_ascii=False, indent=2)
 
-@mcp.tool()
-async def crm_get_lead(lead_id: int) -> str:
-    """Получить детали конкретного лида по ID"""
-    result = await b24("crm.lead.get", {"id": lead_id})
-    return json.dumps(result.get("result", {}), ensure_ascii=False, indent=2)
+    return StreamingResponse(event_stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-@mcp.tool()
-async def crm_create_lead(title: str, name: str = "", last_name: str = "", phone: str = "", email: str = "", comments: str = "") -> str:
-    """Создать новый лид в CRM"""
-    fields = {"TITLE": title}
-    if name: fields["NAME"] = name
-    if last_name: fields["LAST_NAME"] = last_name
-    if phone: fields["PHONE"] = [{"VALUE": phone, "VALUE_TYPE": "WORK"}]
-    if email: fields["EMAIL"] = [{"VALUE": email, "VALUE_TYPE": "WORK"}]
-    if comments: fields["COMMENTS"] = comments
-    result = await b24("crm.lead.add", {"fields": fields})
-    return json.dumps(result, ensure_ascii=False)
 
-@mcp.tool()
-async def crm_update_lead(lead_id: int, fields: str) -> str:
-    """Обновить лид. fields — JSON строка с полями, например '{\"STATUS_ID\": \"IN_PROCESS\"}'"""
-    result = await b24("crm.lead.update", {"id": lead_id, "fields": json.loads(fields)})
-    return json.dumps(result, ensure_ascii=False)
+@app.post("/sse")
+async def sse_post(request: Request):
+    data = await request.json()
+    response = await handle_rpc(data)
+    return response
 
-# ─── CRM: Сделки ──────────────────────────────────────────────────────────────
 
-@mcp.tool()
-async def crm_get_deals(limit: int = 20, filter: str = "") -> str:
-    """Получить список сделок из CRM"""
-    params = {"order": {"DATE_CREATE": "DESC"}, "select": ["ID", "TITLE", "STAGE_ID", "OPPORTUNITY", "CURRENCY_ID", "CONTACT_ID", "COMPANY_ID", "ASSIGNED_BY_ID", "DATE_CREATE"], "start": 0, "limit": limit}
-    if filter:
-        try:
-            params["filter"] = json.loads(filter)
-        except Exception:
-            pass
-    result = await b24("crm.deal.list", params)
-    return json.dumps(result.get("result", []), ensure_ascii=False, indent=2)
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
-@mcp.tool()
-async def crm_get_deal(deal_id: int) -> str:
-    """Получить детали сделки по ID"""
-    result = await b24("crm.deal.get", {"id": deal_id})
-    return json.dumps(result.get("result", {}), ensure_ascii=False, indent=2)
-
-@mcp.tool()
-async def crm_create_deal(title: str, stage_id: str = "NEW", opportunity: float = 0, contact_id: int = 0) -> str:
-    """Создать новую сделку"""
-    fields = {"TITLE": title, "STAGE_ID": stage_id}
-    if opportunity: fields["OPPORTUNITY"] = opportunity
-    if contact_id: fields["CONTACT_ID"] = contact_id
-    result = await b24("crm.deal.add", {"fields": fields})
-    return json.dumps(result, ensure_ascii=False)
-
-# ─── CRM: Контакты ────────────────────────────────────────────────────────────
-
-@mcp.tool()
-async def crm_get_contacts(limit: int = 20, filter: str = "") -> str:
-    """Получить список контактов"""
-    params = {"order": {"DATE_CREATE": "DESC"}, "select": ["ID", "NAME", "LAST_NAME", "PHONE", "EMAIL", "COMPANY_ID"], "start": 0, "limit": limit}
-    if filter:
-        try:
-            params["filter"] = json.loads(filter)
-        except Exception:
-            pass
-    result = await b24("crm.contact.list", params)
-    return json.dumps(result.get("result", []), ensure_ascii=False, indent=2)
-
-@mcp.tool()
-async def crm_create_contact(name: str, last_name: str = "", phone: str = "", email: str = "") -> str:
-    """Создать контакт в CRM"""
-    fields = {"NAME": name}
-    if last_name: fields["LAST_NAME"] = last_name
-    if phone: fields["PHONE"] = [{"VALUE": phone, "VALUE_TYPE": "WORK"}]
-    if email: fields["EMAIL"] = [{"VALUE": email, "VALUE_TYPE": "WORK"}]
-    result = await b24("crm.contact.add", {"fields": fields})
-    return json.dumps(result, ensure_ascii=False)
-
-# ─── Задачи ───────────────────────────────────────────────────────────────────
-
-@mcp.tool()
-async def tasks_get(limit: int = 20, filter: str = "") -> str:
-    """Получить список задач. filter — JSON строка, например '{\"STATUS\": \"2\"}' (2=в работе, 3=завершена)"""
-    params = {"order": {"CREATED_DATE": "desc"}, "select": ["ID", "TITLE", "STATUS", "RESPONSIBLE_ID", "CREATED_DATE", "DEADLINE", "DESCRIPTION"], "params": {"NAV_PARAMS": {"nPageSize": limit}}}
-    if filter:
-        try:
-            params["filter"] = json.loads(filter)
-        except Exception:
-            pass
-    result = await b24("tasks.task.list", params)
-    tasks = result.get("result", {}).get("tasks", [])
-    return json.dumps(tasks, ensure_ascii=False, indent=2)
-
-@mcp.tool()
-async def tasks_get_task(task_id: int) -> str:
-    """Получить детали задачи по ID"""
-    result = await b24("tasks.task.get", {"taskId": task_id, "select": ["ID", "TITLE", "DESCRIPTION", "STATUS", "RESPONSIBLE_ID", "CREATED_DATE", "DEADLINE", "TAGS", "COMMENTS_COUNT"]})
-    return json.dumps(result.get("result", {}).get("task", {}), ensure_ascii=False, indent=2)
-
-@mcp.tool()
-async def tasks_create(title: str, description: str = "", responsible_id: int = 0, deadline: str = "") -> str:
-    """Создать задачу. deadline формат: 2026-06-30T18:00:00"""
-    fields = {"TITLE": title}
-    if description: fields["DESCRIPTION"] = description
-    if responsible_id: fields["RESPONSIBLE_ID"] = responsible_id
-    if deadline: fields["DEADLINE"] = deadline
-    result = await b24("tasks.task.add", {"fields": fields})
-    return json.dumps(result.get("result", {}), ensure_ascii=False)
-
-@mcp.tool()
-async def tasks_update(task_id: int, fields: str) -> str:
-    """Обновить задачу. fields — JSON строка с полями"""
-    result = await b24("tasks.task.update", {"taskId": task_id, "fields": json.loads(fields)})
-    return json.dumps(result.get("result", {}), ensure_ascii=False)
-
-@mcp.tool()
-async def tasks_complete(task_id: int) -> str:
-    """Завершить задачу"""
-    result = await b24("tasks.task.complete", {"taskId": task_id})
-    return json.dumps(result, ensure_ascii=False)
-
-# ─── Телефония / звонки ───────────────────────────────────────────────────────
-
-@mcp.tool()
-async def telephony_get_calls(limit: int = 20, filter: str = "") -> str:
-    """Получить список звонков. filter — JSON строка, например '{\"CALL_TYPE\": \"1\"}' (1=вход, 2=исход)"""
-    params = {"order": {"CALL_START_DATE": "DESC"}, "select": ["ID", "CALL_TYPE", "CALL_DURATION", "CALL_START_DATE", "PHONE_NUMBER", "PORTAL_USER_ID", "CRM_ENTITY_TYPE", "CRM_ENTITY_ID", "CALL_FAILED_CODE"], "filter": {}, "limit": limit}
-    if filter:
-        try:
-            params["filter"].update(json.loads(filter))
-        except Exception:
-            pass
-    result = await b24("voximplant.statistic.get", params)
-    return json.dumps(result.get("result", []), ensure_ascii=False, indent=2)
-
-@mcp.tool()
-async def telephony_get_stats(date_from: str = "", date_to: str = "") -> str:
-    """Получить статистику звонков за период. Формат дат: 2026-05-01"""
-    filter_params = {}
-    if date_from: filter_params[">CALL_START_DATE"] = date_from
-    if date_to: filter_params["<CALL_START_DATE"] = date_to
-    result = await b24("voximplant.statistic.get", {"filter": filter_params, "select": ["PORTAL_USER_ID", "CALL_TYPE", "CALL_DURATION", "CALL_FAILED_CODE"], "limit": 50})
-    return json.dumps(result.get("result", []), ensure_ascii=False, indent=2)
-
-# ─── Пользователи / сотрудники ────────────────────────────────────────────────
-
-@mcp.tool()
-async def users_get(limit: int = 50, active_only: bool = True) -> str:
-    """Получить список сотрудников"""
-    params = {"select": ["ID", "NAME", "LAST_NAME", "EMAIL", "PERSONAL_PHONE", "WORK_PHONE", "UF_DEPARTMENT", "ACTIVE"], "filter": {}}
-    if active_only:
-        params["filter"]["ACTIVE"] = True
-    result = await b24("user.get", params)
-    return json.dumps(result.get("result", []), ensure_ascii=False, indent=2)
-
-@mcp.tool()
-async def users_get_user(user_id: int) -> str:
-    """Получить информацию о сотруднике по ID"""
-    result = await b24("user.get", {"filter": {"ID": user_id}})
-    users = result.get("result", [])
-    return json.dumps(users[0] if users else {}, ensure_ascii=False, indent=2)
-
-@mcp.tool()
-async def users_get_current() -> str:
-    """Получить информацию о текущем пользователе вебхука"""
-    result = await b24("profile")
-    return json.dumps(result.get("result", {}), ensure_ascii=False, indent=2)
-
-# ─── Запуск ───────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import sys
-    transport = sys.argv[1] if len(sys.argv) > 1 else "sse"
-    if transport == "sse":
-        mcp.run(transport="sse")
-    else:
-        mcp.run(transport="stdio")
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
